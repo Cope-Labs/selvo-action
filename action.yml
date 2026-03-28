@@ -8,7 +8,7 @@ branding:
 
 inputs:
   api-key:
-    description: "selvo API key (from selvo.fly.dev)"
+    description: "selvo API key (from selvo.dev)"
     required: true
   ecosystem:
     description: "Ecosystem to scan (debian, ubuntu, fedora, alpine, arch, all)"
@@ -37,7 +37,7 @@ inputs:
   api-url:
     description: "selvo API base URL"
     required: false
-    default: "https://selvo.fly.dev"
+    default: "https://selvo.dev"
 
 outputs:
   total-packages:
