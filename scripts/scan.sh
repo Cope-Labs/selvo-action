@@ -6,18 +6,63 @@ set -euo pipefail
 API="${SELVO_API_URL}/api/v1"
 POLL_INTERVAL=5
 POLL_TIMEOUT=600  # 10 minutes
+SCAN_MODE="${SELVO_SCAN_MODE:-auto}"
 
-# ── Submit analysis job ─────────────────────────────────────────────────
+# ── Detect scan method ──────────────────────────────────────────────────
+# "auto" tries to collect real packages from the runner first (most accurate),
+# falls back to reference scan if no package manager is found.
 
-echo "::group::Submitting analysis to selvo API"
-RESPONSE=$(curl -sf -X POST "${API}/analyze" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: ${SELVO_API_KEY}" \
-  -d "{\"ecosystem\": \"${SELVO_ECOSYSTEM}\", \"limit\": ${SELVO_LIMIT}}")
+submit_scan() {
+  if [ "$SCAN_MODE" = "reference" ]; then
+    echo "Using reference scan (common packages, not runner-specific)"
+    RESPONSE=$(curl -sf -X POST "${API}/analyze" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: ${SELVO_API_KEY}" \
+      -d "{\"ecosystem\": \"${SELVO_ECOSYSTEM}\", \"limit\": ${SELVO_LIMIT}}")
+    echo "$RESPONSE"
+    return
+  fi
 
-JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id')
-if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
-  echo "::error::Failed to start analysis job. Response: $RESPONSE"
+  # Try to collect real packages from the CI runner
+  PKGS=""
+  ECO="${SELVO_ECOSYSTEM}"
+  if command -v dpkg-query >/dev/null 2>&1; then
+    PKGS=$(dpkg-query -W -f='${db:Status-Abbrev}  ${Package}  ${Version}\n' 2>/dev/null || true)
+    [ "$ECO" = "all" ] && ECO="ubuntu"
+  elif command -v rpm >/dev/null 2>&1; then
+    PKGS=$(rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null || true)
+    [ "$ECO" = "all" ] && ECO="fedora"
+  elif command -v apk >/dev/null 2>&1; then
+    PKGS=$(apk info -v 2>/dev/null || true)
+    [ "$ECO" = "all" ] && ECO="alpine"
+  fi
+
+  if [ -n "$PKGS" ]; then
+    PKG_COUNT=$(echo "$PKGS" | wc -l)
+    echo "Scanning ${PKG_COUNT} real packages from runner (${ECO})"
+    PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'packages': sys.stdin.read(), 'ecosystem': '${ECO}'}))" <<< "$PKGS")
+    RESPONSE=$(curl -sf -X POST "${API}/scan/packages" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: ${SELVO_API_KEY}" \
+      -d "$PAYLOAD")
+    echo "$RESPONSE"
+  else
+    echo "No package manager found on runner — falling back to reference scan"
+    RESPONSE=$(curl -sf -X POST "${API}/analyze" \
+      -H "Content-Type: application/json" \
+      -H "X-API-Key: ${SELVO_API_KEY}" \
+      -d "{\"ecosystem\": \"${SELVO_ECOSYSTEM}\", \"limit\": ${SELVO_LIMIT}}")
+    echo "$RESPONSE"
+  fi
+}
+
+# ── Submit ──────────────────────────────────────────────────────────────
+
+echo "::group::Submitting scan to selvo API"
+SUBMIT_RESULT=$(submit_scan)
+JOB_ID=$(echo "$SUBMIT_RESULT" | tail -1 | jq -r '.job_id // empty')
+if [ -z "$JOB_ID" ]; then
+  echo "::error::Failed to start scan. Response: $SUBMIT_RESULT"
   exit 1
 fi
 echo "Job submitted: $JOB_ID"
@@ -29,17 +74,15 @@ echo "::group::Waiting for results"
 ELAPSED=0
 while [ "$ELAPSED" -lt "$POLL_TIMEOUT" ]; do
   RESULT=$(curl -sf "${API}/jobs/${JOB_ID}" \
-    -H "X-API-Key: ${SELVO_API_KEY}")
+    -H "X-API-Key: ${SELVO_API_KEY}" || echo '{"status":"poll_error"}')
 
   STATUS=$(echo "$RESULT" | jq -r '.status')
   echo "  Status: $STATUS (${ELAPSED}s)"
 
-  if [ "$STATUS" = "done" ]; then
-    break
-  fi
+  if [ "$STATUS" = "done" ]; then break; fi
   if [ "$STATUS" = "error" ]; then
     ERROR=$(echo "$RESULT" | jq -r '.error // "unknown error"')
-    echo "::error::Analysis failed: $ERROR"
+    echo "::error::Scan failed: $ERROR"
     exit 1
   fi
 
@@ -48,21 +91,23 @@ while [ "$ELAPSED" -lt "$POLL_TIMEOUT" ]; do
 done
 
 if [ "$STATUS" != "done" ]; then
-  echo "::error::Analysis timed out after ${POLL_TIMEOUT}s"
+  echo "::error::Scan timed out after ${POLL_TIMEOUT}s"
   exit 1
 fi
 echo "::endgroup::"
 
 # ── Parse results ───────────────────────────────────────────────────────
+# Handle both analyze (top_5) and scan/packages (top_10) response formats
 
-PACKAGES=$(echo "$RESULT" | jq -r '.result.packages // []')
-TOTAL=$(echo "$PACKAGES" | jq 'length')
-WITH_CVES=$(echo "$PACKAGES" | jq '[.[] | select((.cve_ids // []) | length > 0)] | length')
-KEV_COUNT=$(echo "$PACKAGES" | jq '[.[] | select(.in_cisa_kev == true)] | length')
-WEAPONIZED=$(echo "$PACKAGES" | jq '[.[] | select(.exploit_maturity == "weaponized")] | length')
-MAX_SCORE=$(echo "$PACKAGES" | jq '[.[].score // 0] | max // 0')
-OUTDATED=$(echo "$PACKAGES" | jq '[.[] | select(.is_outdated == true)] | length')
-SLA_BREACH=$(echo "$PACKAGES" | jq '[.[] | select(.sla_band == "breach" or .sla_band == "critical")] | length')
+INNER=$(echo "$RESULT" | jq '.result')
+TOTAL=$(echo "$INNER" | jq -r '.total_packages // 0')
+WITH_CVES=$(echo "$INNER" | jq -r '.with_cves // 0')
+KEV_COUNT=$(echo "$INNER" | jq -r '.kev_count // 0')
+
+# top_10 from scan/packages, top_5 from analyze
+TOP=$(echo "$INNER" | jq '.top_10 // .top_5 // []')
+WEAPONIZED=$(echo "$TOP" | jq '[.[] | select(.exploit_maturity == "weaponized")] | length')
+MAX_SCORE=$(echo "$TOP" | jq '[.[].score // 0] | max // 0')
 
 # ── Set outputs ─────────────────────────────────────────────────────────
 
@@ -74,33 +119,38 @@ echo "max-score=${MAX_SCORE}" >> "$GITHUB_OUTPUT"
 
 # ── Write summary ──────────────────────────────────────────────────────
 
+SOURCE=$(echo "$INNER" | jq -r '.source // "reference"')
+SOURCE_LABEL="Reference scan"
+[ "$SOURCE" = "your_system" ] && SOURCE_LABEL="Runner system packages"
+
 cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
 ## selvo Security Scan
 
+> ${SOURCE_LABEL}
+
 | Metric | Count |
 |--------|-------|
-| Packages analyzed | **${TOTAL}** |
-| With CVEs | **${WITH_CVES}** |
+| Packages scanned | **${TOTAL}** |
+| With open CVEs | **${WITH_CVES}** |
 | CISA KEV | **${KEV_COUNT}** |
 | Weaponized exploits | **${WEAPONIZED}** |
-| Outdated | **${OUTDATED}** |
-| SLA breaches | **${SLA_BREACH}** |
 | Max risk score | **${MAX_SCORE}** |
 
 SUMMARY
 
-# Top 10 riskiest packages
-if [ "$TOTAL" -gt 0 ]; then
+# Top packages table
+TOP_COUNT=$(echo "$TOP" | jq 'length')
+if [ "$TOP_COUNT" -gt 0 ]; then
   cat >> "$GITHUB_STEP_SUMMARY" <<'TABLE_HEADER'
-### Top packages by risk score
+### Highest-risk packages
 
-| # | Package | Score | CVEs | KEV | Exploit |
-|---|---------|-------|------|-----|---------|
+| # | Package | Score | CVEs | CVSS | EPSS |
+|---|---------|-------|------|------|------|
 TABLE_HEADER
 
-  echo "$PACKAGES" | jq -r '
-    sort_by(-.score) | .[0:10] | to_entries[] |
-    "| \(.key + 1) | \(.value.name) | \(.value.score) | \((.value.cve_ids // []) | length) | \(if .value.in_cisa_kev then "YES" else "-" end) | \(.value.exploit_maturity // "-") |"
+  echo "$TOP" | jq -r '
+    sort_by(-.score) | to_entries[] |
+    "| \(.key + 1) | \(.value.name) | \(.value.score) | \(.value.cve_count // 0) | \(.value.max_cvss // 0) | \(.value.max_epss // 0) |"
   ' >> "$GITHUB_STEP_SUMMARY"
 fi
 
@@ -123,7 +173,7 @@ fi
 
 SCORE_THRESHOLD="${SELVO_MIN_SCORE}"
 if [ "$SCORE_THRESHOLD" != "0" ]; then
-  OVER=$(echo "$PACKAGES" | jq --argjson t "$SCORE_THRESHOLD" '[.[] | select(.score > $t)] | length')
+  OVER=$(echo "$TOP" | jq --argjson t "$SCORE_THRESHOLD" '[.[] | select(.score > $t)] | length')
   if [ "$OVER" -gt 0 ]; then
     echo "::error::Gate failed: ${OVER} package(s) scored above threshold ${SCORE_THRESHOLD}"
     PASSED=false
@@ -132,8 +182,5 @@ fi
 
 echo "passed=${PASSED}" >> "$GITHUB_OUTPUT"
 
-if [ "$PASSED" = "false" ]; then
-  exit 1
-fi
-
+if [ "$PASSED" = "false" ]; then exit 1; fi
 echo "All gates passed."
