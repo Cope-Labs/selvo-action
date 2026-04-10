@@ -1,6 +1,6 @@
 name: "selvo Security Scan"
 description: "Scan Linux packages for CVEs, exploit maturity, CISA KEV status, and SLA breaches via the selvo API."
-author: "sethc5"
+author: "Cope Labs LLC"
 
 branding:
   icon: "shield"
