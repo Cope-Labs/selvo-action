@@ -1,5 +1,5 @@
 name: "selvo Security Scan"
-description: "Scan Linux packages for CVEs, exploit maturity, CISA KEV status, and SLA breaches via the selvo API."
+description: "Scan Linux packages for CVEs, exploit maturity, CISA KEV status, and SLA breaches with selvo."
 author: "Cope Labs LLC"
 
 branding:
@@ -7,64 +7,286 @@ branding:
   color: "red"
 
 inputs:
-  api-key:
-    description: "selvo API key (from selvo.dev)"
-    required: true
   ecosystem:
     description: "Ecosystem to scan (debian, ubuntu, fedora, alpine, arch, all)"
     required: false
     default: "all"
   limit:
-    description: "Max packages for reference scan (ignored for system scan)"
+    description: "Max packages to analyze"
     required: false
     default: "50"
-  scan-mode:
-    description: "Scan mode: auto (detect runner packages), reference (common packages), system (force runner scan)"
+  context:
+    description: "Version data source: auto (local pkgs if available, else reference), local, reference"
     required: false
     default: "auto"
+  sbom:
+    description: "Path to a CycloneDX/SPDX SBOM to scan instead of running discovery"
+    required: false
+    default: ""
+  grype-report:
+    description: "Path to a Grype JSON report to scan instead of running discovery"
+    required: false
+    default: ""
+  trivy-report:
+    description: "Path to a Trivy JSON report to scan instead of running discovery"
+    required: false
+    default: ""
+  image:
+    description: "Container image to scan (e.g. ubuntu:24.04)"
+    required: false
+    default: ""
   fail-on-kev:
-    description: "Fail if any CISA KEV packages found"
+    description: "Fail if any CISA KEV packages are found"
     required: false
     default: "false"
   fail-on-weaponized:
-    description: "Fail if any weaponized exploits found"
+    description: "Fail if any weaponized exploits are found"
     required: false
     default: "false"
   min-score:
     description: "Fail if any package scores above this threshold (0 to disable)"
     required: false
     default: "0"
-  api-url:
-    description: "selvo API base URL"
+  post-comment:
+    description: "Post results as a PR comment (requires pull_request event + GITHUB_TOKEN)"
     required: false
-    default: "https://selvo.dev"
+    default: "true"
+  python-version:
+    description: "Python version used to install selvo"
+    required: false
+    default: "3.12"
+  selvo-version:
+    description: "Pin a specific selvo version (e.g. '2.0.0'). Empty = latest."
+    required: false
+    default: ""
 
 outputs:
   total-packages:
-    description: "Total packages scanned"
+    description: "Total packages analyzed"
+    value: ${{ steps.parse.outputs.total-packages }}
   packages-with-cves:
     description: "Number of packages with open CVEs"
+    value: ${{ steps.parse.outputs.packages-with-cves }}
   kev-count:
     description: "Number of CISA KEV packages"
+    value: ${{ steps.parse.outputs.kev-count }}
   weaponized-count:
     description: "Number of packages with weaponized exploits"
+    value: ${{ steps.parse.outputs.weaponized-count }}
   max-score:
     description: "Highest package risk score"
+    value: ${{ steps.parse.outputs.max-score }}
   passed:
     description: "'true' if all gates passed, 'false' otherwise"
+    value: ${{ steps.gate.outputs.passed }}
+  result-file:
+    description: "Path to the full selvo JSON output"
+    value: ${{ steps.scan.outputs.result-file }}
 
 runs:
   using: "composite"
   steps:
-    - name: Run selvo scan
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: "pip"
+
+    - name: Install selvo
       shell: bash
       env:
-        SELVO_API_KEY: ${{ inputs.api-key }}
-        SELVO_API_URL: ${{ inputs.api-url }}
+        SELVO_VERSION: ${{ inputs.selvo-version }}
+      run: |
+        if [ -n "$SELVO_VERSION" ]; then
+          python -m pip install --upgrade "selvo==${SELVO_VERSION}"
+        else
+          python -m pip install --upgrade selvo
+        fi
+        selvo --help >/dev/null
+
+    - name: Run selvo scan
+      id: scan
+      shell: bash
+      env:
         SELVO_ECOSYSTEM: ${{ inputs.ecosystem }}
         SELVO_LIMIT: ${{ inputs.limit }}
-        SELVO_SCAN_MODE: ${{ inputs.scan-mode }}
-        SELVO_FAIL_ON_KEV: ${{ inputs.fail-on-kev }}
-        SELVO_FAIL_ON_WEAPONIZED: ${{ inputs.fail-on-weaponized }}
-        SELVO_MIN_SCORE: ${{ inputs.min-score }}
-      run: bash "${{ github.action_path }}/scripts/scan.sh"
+        SELVO_CONTEXT: ${{ inputs.context }}
+        SELVO_SBOM: ${{ inputs.sbom }}
+        SELVO_GRYPE: ${{ inputs.grype-report }}
+        SELVO_TRIVY: ${{ inputs.trivy-report }}
+        SELVO_IMAGE: ${{ inputs.image }}
+      run: |
+        OUT="${RUNNER_TEMP:-/tmp}/selvo-result.json"
+        echo "result-file=${OUT}" >> "$GITHUB_OUTPUT"
+
+        if [ -n "$SELVO_SBOM" ]; then
+          selvo scan --sbom "$SELVO_SBOM" -o json -f "$OUT"
+        elif [ -n "$SELVO_GRYPE" ]; then
+          selvo scan --grype "$SELVO_GRYPE" -o json -f "$OUT"
+        elif [ -n "$SELVO_TRIVY" ]; then
+          selvo scan --trivy "$SELVO_TRIVY" -o json -f "$OUT"
+        elif [ -n "$SELVO_IMAGE" ]; then
+          selvo scan --image "$SELVO_IMAGE" -o json -f "$OUT"
+        else
+          selvo analyze \
+            -e "$SELVO_ECOSYSTEM" \
+            -n "$SELVO_LIMIT" \
+            -C "$SELVO_CONTEXT" \
+            -o json \
+            -f "$OUT"
+        fi
+
+        # Sanity-check: file exists and is valid JSON.
+        if [ ! -s "$OUT" ]; then
+          echo "::error::selvo produced no output at $OUT"
+          exit 1
+        fi
+        python -c "import json; json.load(open('$OUT'))" >/dev/null
+
+    - name: Parse results
+      id: parse
+      shell: bash
+      env:
+        RESULT: ${{ steps.scan.outputs.result-file }}
+      run: |
+        # selvo emits either {meta, packages: [...]} (CLI w/ context) or a flat
+        # array (legacy). Normalize to the array form before counting.
+        PKGS=$(jq '(.packages // .)' "$RESULT")
+
+        TOTAL=$(echo "$PKGS" | jq 'length')
+        WITH_CVES=$(echo "$PKGS" | jq '[.[] | select((.cve_count // (.cve_ids | length // 0)) > 0)] | length')
+        KEV=$(echo "$PKGS" | jq '[.[] | select(.in_cisa_kev == true)] | length')
+        WEAP=$(echo "$PKGS" | jq '[.[] | select(.exploit_maturity == "weaponized")] | length')
+        MAX_SCORE=$(echo "$PKGS" | jq '[.[].score // 0] | max // 0')
+
+        {
+          echo "total-packages=${TOTAL}"
+          echo "packages-with-cves=${WITH_CVES}"
+          echo "kev-count=${KEV}"
+          echo "weaponized-count=${WEAP}"
+          echo "max-score=${MAX_SCORE}"
+        } >> "$GITHUB_OUTPUT"
+
+        # ── Step summary ────────────────────────────────────────────────────
+        cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+        ## selvo Security Scan
+
+        | Metric | Count |
+        |--------|-------|
+        | Packages scanned | **${TOTAL}** |
+        | With open CVEs | **${WITH_CVES}** |
+        | CISA KEV | **${KEV}** |
+        | Weaponized exploits | **${WEAP}** |
+        | Max risk score | **${MAX_SCORE}** |
+
+        SUMMARY
+
+        TOP=$(echo "$PKGS" | jq '[.[] | select((.cve_count // (.cve_ids | length // 0)) > 0)] | sort_by(-.score) | .[:10]')
+        TOP_COUNT=$(echo "$TOP" | jq 'length')
+        if [ "$TOP_COUNT" -gt 0 ]; then
+          cat >> "$GITHUB_STEP_SUMMARY" <<'TBL'
+        ### Highest-risk packages
+
+        | # | Package | Score | CVEs | Max CVSS | Max EPSS | KEV | Exploit |
+        |---|---------|-------|------|----------|----------|-----|---------|
+        TBL
+          echo "$TOP" | jq -r '
+            to_entries[] |
+            "| \(.key + 1) | \(.value.name) | \(.value.score) | \(.value.cve_count // (.value.cve_ids | length // 0)) | \(.value.max_cvss // 0) | \(.value.max_epss // 0) | \(if .value.in_cisa_kev then "yes" else "" end) | \(.value.exploit_maturity // "") |"
+          ' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        printf '\n*Powered by [selvo](https://selvo.dev) — open-source Linux dependency risk scanner. Scale to fleets at [selvo.dev](https://selvo.dev).*\n' >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post PR comment
+      if: inputs.post-comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        RESULT: ${{ steps.scan.outputs.result-file }}
+        TOTAL: ${{ steps.parse.outputs.total-packages }}
+        WITH_CVES: ${{ steps.parse.outputs.packages-with-cves }}
+        KEV: ${{ steps.parse.outputs.kev-count }}
+        WEAP: ${{ steps.parse.outputs.weaponized-count }}
+        MAX_SCORE: ${{ steps.parse.outputs.max-score }}
+      run: |
+        PR_NUMBER=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
+        [ -z "$PR_NUMBER" ] && exit 0
+
+        PKGS=$(jq '(.packages // .)' "$RESULT")
+        TABLE=$(echo "$PKGS" | jq -r '
+          [.[] | select((.cve_count // (.cve_ids | length // 0)) > 0)] | sort_by(-.score) | .[:10] |
+          .[] | "| \(.name) | \(.score) | \(.cve_count // (.cve_ids | length // 0)) | \(.max_cvss // 0) | \(if .in_cisa_kev then "yes" else "" end) |"
+        ')
+
+        BODY=$(cat <<MD
+        ## selvo Security Scan
+
+        | Metric | Value |
+        |--------|-------|
+        | Packages scanned | **${TOTAL}** |
+        | With open CVEs | **${WITH_CVES}** |
+        | CISA KEV | **${KEV}** |
+        | Weaponized exploits | **${WEAP}** |
+        | Max risk score | **${MAX_SCORE}** |
+
+        <details><summary>Top packages by risk</summary>
+
+        | Package | Score | CVEs | CVSS | KEV |
+        |---------|-------|------|------|-----|
+        ${TABLE}
+
+        </details>
+
+        *Powered by [selvo](https://selvo.dev)*
+        MD
+        )
+
+        BODY_JSON=$(jq -n --arg b "$BODY" '{body: $b}')
+        EXISTING=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          | jq -r '.[] | select(.body | startswith("## selvo Security Scan")) | .id' | head -1)
+
+        if [ -n "$EXISTING" ]; then
+          curl -sfL -X PATCH -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" \
+            -d "$BODY_JSON" >/dev/null
+        else
+          curl -sfL -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -d "$BODY_JSON" >/dev/null
+        fi
+
+    - name: Gate checks
+      id: gate
+      shell: bash
+      env:
+        FAIL_ON_KEV: ${{ inputs.fail-on-kev }}
+        FAIL_ON_WEAPONIZED: ${{ inputs.fail-on-weaponized }}
+        MIN_SCORE: ${{ inputs.min-score }}
+        KEV: ${{ steps.parse.outputs.kev-count }}
+        WEAP: ${{ steps.parse.outputs.weaponized-count }}
+        MAX_SCORE: ${{ steps.parse.outputs.max-score }}
+      run: |
+        PASSED=true
+        if [ "$FAIL_ON_KEV" = "true" ] && [ "$KEV" -gt 0 ]; then
+          echo "::error::Gate failed: ${KEV} CISA KEV package(s) found"
+          PASSED=false
+        fi
+        if [ "$FAIL_ON_WEAPONIZED" = "true" ] && [ "$WEAP" -gt 0 ]; then
+          echo "::error::Gate failed: ${WEAP} package(s) with weaponized exploits"
+          PASSED=false
+        fi
+        if [ "$MIN_SCORE" != "0" ]; then
+          # MAX_SCORE may be a float; awk handles both ints and floats.
+          OVER=$(awk -v a="$MAX_SCORE" -v b="$MIN_SCORE" 'BEGIN{exit !(a+0 > b+0)}' && echo 1 || echo 0)
+          if [ "$OVER" = "1" ]; then
+            echo "::error::Gate failed: max score ${MAX_SCORE} exceeds threshold ${MIN_SCORE}"
+            PASSED=false
+          fi
+        fi
+        echo "passed=${PASSED}" >> "$GITHUB_OUTPUT"
+        [ "$PASSED" = "false" ] && exit 1
+        echo "All gates passed."
