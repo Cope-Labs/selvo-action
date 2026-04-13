@@ -1,5 +1,9 @@
 # selvo Security Scan Action
 
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-selvo--security--scan-blue?logo=github)](https://github.com/marketplace/actions/selvo-security-scan)
+[![Release](https://img.shields.io/github/v/release/Cope-Labs/selvo-action?sort=semver)](https://github.com/Cope-Labs/selvo-action/releases)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
 Scan your Linux infrastructure packages for CVEs, exploit maturity, CISA KEV status, and SLA breaches — directly in your CI pipeline.
 
 Wraps the [`selvo`](https://github.com/Cope-Labs/selvo) CLI. **No account or API key required** — selvo is open-source and runs entirely inside the runner.
